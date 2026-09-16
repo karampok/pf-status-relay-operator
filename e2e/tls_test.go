@@ -18,12 +18,12 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	configv1 "github.com/openshift/api/config/v1"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -73,8 +73,44 @@ var _ = Describe("TLS compliance", Label("e2e", "tls"), func() {
 
 	// PContext: changing the APIServer TLS profile triggers a kube-apiserver
 	// rollout. Run on demand to verify the operator reloads correctly.
-	PContext("when adding custom profile", func() {
+	Context("when adding custom profile", func() {
 		BeforeEach(func(ctx context.Context) {
+			customProfile := &configv1.TLSSecurityProfile{
+				Type: configv1.TLSProfileCustomType,
+				Custom: &configv1.CustomTLSProfile{
+					TLSProfileSpec: configv1.TLSProfileSpec{
+						Ciphers:       configv1.TLSProfiles[configv1.TLSProfileIntermediateType].Ciphers,
+						MinTLSVersion: configv1.TLSProfiles[configv1.TLSProfileIntermediateType].MinTLSVersion,
+						Groups:        []configv1.TLSGroup{configv1.TLSGroupSecP384r1},
+					},
+				},
+			}
+
+			patch, err := json.Marshal(map[string]any{
+				"spec": map[string]any{"tlsSecurityProfile": customProfile},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			capabilityProbe := &configv1.APIServer{}
+			capabilityProbe.Name = "cluster"
+			Expect(k8sClient.Patch(ctx, capabilityProbe,
+				client.RawPatch(types.MergePatchType, patch), client.DryRunAll,
+			)).To(Succeed())
+			if capabilityProbe.Spec.TLSSecurityProfile == nil ||
+				capabilityProbe.Spec.TLSSecurityProfile.Custom == nil ||
+				len(capabilityProbe.Spec.TLSSecurityProfile.Custom.Groups) == 0 {
+				Skip("APIServer API does not support custom TLS groups")
+			}
+
+			pods := &corev1.PodList{}
+			Expect(k8sClient.List(ctx, pods,
+				client.InNamespace(operatorNS),
+				client.MatchingLabels{"control-plane": "controller-manager"},
+			)).To(Succeed())
+			Expect(pods.Items).To(HaveLen(1))
+			Expect(pods.Items[0].Status.ContainerStatuses).NotTo(BeEmpty())
+			podName := pods.Items[0].Name
+			restartCount := pods.Items[0].Status.ContainerStatuses[0].RestartCount
+
 			apiserver := &configv1.APIServer{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cluster"}, apiserver)).To(Succeed())
 			savedProfile := apiserver.Spec.TLSSecurityProfile.DeepCopy()
@@ -86,27 +122,19 @@ var _ = Describe("TLS compliance", Label("e2e", "tls"), func() {
 				Expect(k8sClient.Update(ctx, apiserver)).To(Succeed())
 			})
 
-			apiserver.Spec.TLSSecurityProfile = &configv1.TLSSecurityProfile{
-				Type: configv1.TLSProfileCustomType,
-				Custom: &configv1.CustomTLSProfile{
-					TLSProfileSpec: configv1.TLSProfileSpec{
-						Ciphers:       configv1.TLSProfiles[configv1.TLSProfileIntermediateType].Ciphers,
-						MinTLSVersion: configv1.TLSProfiles[configv1.TLSProfileIntermediateType].MinTLSVersion,
-						// TODO: when https://github.com/openshift/api/blob/d3390bd/config/v1/types_tlssecurityprofile.go#L229
-						// Groups: []configv1.TLSGroup{configv1.TLSGroupSecP384r1},
-					},
-				},
-			}
+			apiserver.Spec.TLSSecurityProfile = customProfile
 			Expect(k8sClient.Update(ctx, apiserver)).To(Succeed())
 
 			Eventually(func(g Gomega) {
-				deploy := &appsv1.Deployment{}
+				pod := &corev1.Pod{}
 				g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-					Name:      "pf-status-relay-operator-controller-manager",
+					Name:      podName,
 					Namespace: operatorNS,
-				}, deploy)).To(Succeed())
-				g.Expect(deploy.Status.UpdatedReplicas).To(Equal(deploy.Status.Replicas))
-				g.Expect(deploy.Status.ReadyReplicas).To(Equal(deploy.Status.Replicas))
+				}, pod)).To(Succeed())
+				g.Expect(pod.Status.ContainerStatuses).NotTo(BeEmpty())
+				status := pod.Status.ContainerStatuses[0]
+				g.Expect(status.RestartCount).To(BeNumerically(">", restartCount))
+				g.Expect(status.Ready).To(BeTrue())
 			}, "3m", "5s").Should(Succeed())
 		})
 
